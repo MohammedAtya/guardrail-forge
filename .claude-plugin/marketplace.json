@@ -1,0 +1,12 @@
+{
+  "name": "guardrail-forge",
+  "description": "Marketplace for the Guardrail Forge plugin.",
+  "owner": { "name": "Mohammed Atya", "url": "https://github.com/MohammedAtya" },
+  "plugins": [
+    {
+      "name": "guardrail-forge",
+      "source": "./",
+      "description": "Turn corrections into tested, enforced Claude Code guardrails."
+    }
+  ]
+}

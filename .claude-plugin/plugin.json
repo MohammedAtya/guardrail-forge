@@ -1,0 +1,10 @@
+{
+  "name": "guardrail-forge",
+  "description": "Turn a correction (\"don't do that again\") into a tested Claude Code hook instead of a CLAUDE.md line: enforced on every tool call, backtested against your history, tamper-proof.",
+  "version": "2.2.0",
+  "author": { "name": "Mohammed Atya", "url": "https://github.com/MohammedAtya" },
+  "homepage": "https://github.com/MohammedAtya/guardrail-forge",
+  "repository": "https://github.com/MohammedAtya/guardrail-forge",
+  "license": "MIT",
+  "keywords": ["guardrails", "hooks", "safety", "claude-code", "skills"]
+}

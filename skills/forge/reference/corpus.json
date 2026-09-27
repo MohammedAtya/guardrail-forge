@@ -1,0 +1,58 @@
+{
+  "_about": "Common legitimate developer actions, grouped by domain. forge.py replays every new rule against these so a rule is exercised on day one, even with no project history, and across domains the project's history never touched. A hit is not automatically wrong: the human judges it.",
+  "git": [
+    "git status", "git diff", "git diff --staged", "git log --oneline -20", "git add -A", "git commit -m 'Fix login redirect'",
+    "git push origin feature/login", "git push -u origin HEAD", "git pull --rebase", "git fetch origin",
+    "git checkout -b feature/search", "git switch main", "git stash", "git stash pop", "git rebase main",
+    "git merge --no-ff feature/login", "git tag v1.2.0", "git push --tags", "git restore src/app.ts", "git blame src/app.ts"
+  ],
+  "frontend": [
+    "npm install", "npm ci", "npm run dev", "npm run build", "npm test", "npm run lint", "npx tsc --noEmit",
+    "pnpm install", "pnpm add react-query", "pnpm test", "yarn install", "yarn build", "npx prettier --check .",
+    "npx eslint src", "npx vite build", "npx playwright test",
+    {"tool": "Edit", "file_path": "src/components/Button.tsx"}, {"tool": "Edit", "file_path": "src/pages/index.tsx"},
+    {"tool": "Write", "file_path": "src/hooks/useAuth.ts"}, {"tool": "Edit", "file_path": "src/styles/globals.css"},
+    {"tool": "Edit", "file_path": "package.json"}, {"tool": "Edit", "file_path": "tsconfig.json"}
+  ],
+  "backend": [
+    "python3 -m pytest -q", "pytest tests/test_api.py -x", "python3 -m unittest", "pip install -r requirements.txt",
+    "uv sync", "uv run pytest", "poetry install", "python3 manage.py runserver", "uvicorn app.main:app --reload",
+    "go test ./...", "go build ./...", "cargo build", "cargo test", "mvn test", "./gradlew build",
+    {"tool": "Edit", "file_path": "app/api/routes.py"}, {"tool": "Write", "file_path": "app/services/billing.py"},
+    {"tool": "Edit", "file_path": "tests/test_api.py"}, {"tool": "Edit", "file_path": "internal/server/handler.go"},
+    {"tool": "Edit", "file_path": "pyproject.toml"}, {"tool": "Edit", "file_path": "requirements.txt"}
+  ],
+  "database": [
+    "python3 manage.py makemigrations", "python3 manage.py migrate", "alembic revision --autogenerate -m 'add users'",
+    "alembic upgrade head", "npx prisma migrate dev", "npx prisma generate", "psql -c 'select 1'",
+    "sqlite3 app.db '.tables'", "make migrate", "rails db:migrate",
+    {"tool": "Write", "file_path": "migrations/0003_add_users.sql"}, {"tool": "Edit", "file_path": "prisma/schema.prisma"},
+    {"tool": "Edit", "file_path": "db/seeds.rb"}
+  ],
+  "build_ci": [
+    "make", "make build", "make test", "make lint", "make codegen", "make clean", "cmake --build build",
+    "./scripts/build.sh", "bash scripts/release.sh", "npm run generate", "buf generate", "protoc --go_out=. api.proto",
+    {"tool": "Edit", "file_path": ".github/workflows/ci.yml"}, {"tool": "Edit", "file_path": "Makefile"},
+    {"tool": "Edit", "file_path": "scripts/build.sh"}
+  ],
+  "containers": [
+    "docker build -t app .", "docker compose up -d", "docker compose logs -f api", "docker ps", "docker compose down",
+    "kubectl get pods", "kubectl apply -f k8s/deployment.yaml", "helm upgrade --install app ./chart",
+    {"tool": "Edit", "file_path": "Dockerfile"}, {"tool": "Edit", "file_path": "docker-compose.yml"},
+    {"tool": "Edit", "file_path": "k8s/deployment.yaml"}
+  ],
+  "files_and_reads": [
+    "ls -la", "cat README.md", "grep -rn TODO src", "rg 'useState' src", "find . -name '*.ts' -not -path './node_modules/*'",
+    "head -50 src/app.ts", "wc -l src/**/*.ts", "tree -L 2", "mkdir -p src/utils", "cp .env.example .env",
+    "rm -rf node_modules", "rm -rf dist build", "mv src/old.ts src/new.ts", "touch src/utils/index.ts",
+    "sed -i 's/foo/bar/' src/config.ts", "chmod +x scripts/build.sh", "curl -s https://api.github.com/repos/x/y",
+    {"tool": "Edit", "file_path": "README.md"}, {"tool": "Write", "file_path": "docs/architecture.md"},
+    {"tool": "Edit", "file_path": "CHANGELOG.md"}, {"tool": "Edit", "file_path": ".gitignore"},
+    {"tool": "Edit", "file_path": ".env.example"}
+  ],
+  "python_scripts": [
+    "python3 scripts/seed.py", "python3 -c \"import sys; print(sys.version)\"",
+    "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('src/config.ts')\np.write_text(p.read_text().replace('a', 'b'))\nEOF",
+    "node -e \"console.log(require('./package.json').version)\"", "python3 -m http.server 8000"
+  ]
+}
