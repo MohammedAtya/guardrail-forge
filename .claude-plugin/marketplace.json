@@ -6,7 +6,7 @@
     {
       "name": "guardrail-forge",
       "source": "./",
-      "description": "Turn corrections into tested, enforced Claude Code guardrails."
+      "description": "Never-rules and always-rules: tested, enforced Claude Code guardrails."
     }
   ]
 }
