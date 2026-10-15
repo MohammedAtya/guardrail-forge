@@ -13,7 +13,7 @@ CLI:
   forge.py doctor                        installed? hooks registered? dispatcher current? suite green?
   forge.py add RULE.json|- [--dry-run]
   forge.py remove RULE_ID                loosening: the tamper guard asks the human first
-  forge.py list
+  forge.py list [--always]               --always: only always-rules, with their last state
   forge.py test
   forge.py explain EVENT_JSON|-          which rules fire on one tool call
   forge.py split "COMMAND"               how a Bash command is normalised (cmd:) and which paths it writes (path)
@@ -22,6 +22,11 @@ CLI:
   forge.py sandbox status|on [--strict]|off|exclude CMD   OS-level double lock for path rules
   forge.py harvest [--project-dir DIR] [--transcripts DIR] [--min N]
                                          repeated corrections in past sessions, as rule candidates
+
+Rules work both ways: never-rules stop a call; always-rules (a `require` block, created by /always) hold
+Claude to a task once a trigger happens (a file change, a tool call, the user's approval): Claude cannot end
+its reply, or take the next step, until the result is really there. Two attempts per batch of changes,
+then the task is handed to the user; only the user's own words skip or pause it.
 
 Built in, not editable through rules.json: the tamper guard. Any change to the guardrail files
 or to a Claude Code settings file asks the human, so Claude can tighten guardrails but never
@@ -43,8 +48,7 @@ CLASSES = ("safety", "convention", "style")
 DECISIONS = {"PreToolUse": ("deny", "ask"), "PostToolUse": ("nudge",), "Stop": ("block",)}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 HOOK_MARK = "guardrails/forge.py"
-MAX_STOP_BLOCKS = 3
-VERSION = "2.2.0"
+VERSION = "3.0.0"
 LEDGER_TAIL_BYTES = 256 * 1024
 LEDGER_ROTATE_BYTES = 5 * 1024 * 1024
 MUTATING_TOOLS = re.compile(r"Edit|Write|MultiEdit|NotebookEdit|Bash")
@@ -648,7 +652,7 @@ def call_matches(spec, tool_name, tool_input, cwd):
 
 
 def summarise(tool_name, tool_input):
-    for k in ("command", "file_path", "path", "notebook_path", "url", "pattern"):
+    for k in ("command", "file_path", "path", "notebook_path", "url", "pattern", "text"):
         if isinstance(tool_input.get(k), str):
             return redact(f"{tool_name}: {tool_input[k]}")[:200]
     return redact(f"{tool_name}: {json.dumps(tool_input, ensure_ascii=False)}")[:200]
@@ -659,38 +663,231 @@ def fingerprint(tool_name, tool_input):
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------- transcript (Stop gate)
+# ---------------------------------------------------------------- transcript and duties (require)
 
-def transcript_calls(path):
-    calls = []
+def local_time(value):
+    """ISO timestamp -> naive local datetime. Transcripts write UTC ('...Z'); fixtures may write naive local time."""
+    if isinstance(value, _dt.datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        t = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t.astimezone().replace(tzinfo=None) if t.tzinfo else t
+
+
+def entry_events(entry):
+    """One transcript line -> events (name, input, local time). Tool calls keep their tool name;
+    what the user typed becomes ("@user", {"text"}) and what Claude wrote ("@claude", {"text"}).
+    A typed slash command becomes its name and arguments ("/always skip x"); other harness markup is
+    dropped, as are background-task notices (they are not the user's words)."""
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    ts = local_time(entry.get("timestamp"))
+    role = entry.get("type") or (msg or {}).get("role")
+    out = []
+    if role == "user":
+        if entry.get("isMeta"):
+            return out
+        texts = [content] if isinstance(content, str) else [
+            b.get("text", "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text"]
+        for t in texts:
+            name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
+            if name:
+                args = "".join(re.findall(r"<command-args>(.*?)</command-args>", t, re.S))
+                t = f"{name.group(1).strip()} {args.strip()}".strip()
+            if t.strip() and not t.lstrip().startswith("<"):
+                out.append(("@user", {"text": t}, ts))
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                out.append((block.get("name", ""), block.get("input") or {}, ts))
+            elif block.get("type") == "text" and block.get("text", "").strip():
+                out.append(("@claude", {"text": block["text"]}, ts))
+    return out
+
+
+def transcript_events(path):
+    events = []
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
                 try:
-                    entry = json.loads(line)
+                    events += entry_events(json.loads(line))
                 except ValueError:
                     continue
-                msg = entry.get("message") if isinstance(entry, dict) else None
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                            calls.append((block.get("name", ""), block.get("input") or {}))
-    except (FileNotFoundError, TypeError):
+    except (OSError, TypeError):
         pass
-    return calls
+    return events
+
+
+def transcript_calls(path):
+    return [(name, inp) for name, inp, _ts in transcript_events(path) if not name.startswith("@")]
+
+
+def specs(spec):
+    """require.after / require.ran: one {tool, match, unless} or a list of them (any may match)."""
+    return spec if isinstance(spec, list) else [spec] if spec else []
+
+
+def any_matches(spec, name, inp, cwd, prev_claude=None):
+    """Any spec matches this call. A spec with `replying_to` matches a user message only when the last
+    thing Claude wrote before it matches too: a bare "yes" counts as approval only after a proposal."""
+    for s in specs(spec):
+        if call_matches(s, name, inp, cwd) and (
+                not s.get("replying_to") or prev_claude is not None and pattern_matches(s["replying_to"], [prev_claude], cwd)):
+            return True
+    return False
+
+
+# The user's own words switch an always-rule off for a while. Claude's words never do (tightening is
+# free, loosening belongs to the user): only @user events are read here.
+CONTROL_CMD = re.compile(r"^\s*/(?:[\w-]+:)?always\s+(skip|pause|resume)\b\s*([a-z0-9][a-z0-9-]*)?", re.I)
+CONTROL_WORDS = (  # short plain messages only; checked in this order ("unpause" is a resume)
+    ("resume", re.compile(r"(?i)\b(resume|unpause)\b|استئناف|استأنف")),
+    ("pause", re.compile(r"(?i)\bpause\b|إيقاف مؤقت|أوقف مؤقت")),
+    ("skip", re.compile(r"(?i)\b(skip|not now|no need)\b|تخط|ليس الآن|مش الحين|لا داعي")),
+)
+CONTROL_MAX_CHARS = 80
+ATTEMPTS = 2  # blocks per batch of changes before the task is handed to the user
+
+
+def control(event, rule_id):
+    """(action, explicit) when this @user event skips, pauses or resumes the rule, else None."""
+    if event[0] != "@user":
+        return None
+    text = str(event[1].get("text", ""))
+    m = CONTROL_CMD.match(text)
+    if m:
+        target = (m.group(2) or "").lower()
+        return (m.group(1).lower(), True) if target in ("", rule_id) else None
+    if len(text) > CONTROL_MAX_CHARS or text.lstrip().startswith("/"):
+        return None
+    return next(((action, False) for action, rx in CONTROL_WORDS if rx.search(text)), None)
+
+
+def writes_to(event, path, cwd):
+    """Does this call write the given file (an always-rule's own result)?"""
+    rx = glob_to_re(expand(path, cwd))
+    return any(rx.match(expand(c, cwd)) for v in field_values(event[1], "path") for c in path_candidates(v, cwd))
+
+
+def duty_state(rule, events, cwd, now=None, check=None):
+    """Where an always-rule stands after these events (name, input, time).
+
+    A trigger (`after`) opens a batch of changes; a `ran` call handles the batch. With `done_when`,
+    `check(trigger_event)` says whether the result really exists (e.g. the artifact is newer than the
+    last change), so any way of doing the task counts and a failed run does not. `slow_minutes`: a run
+    counts as started for that long before its result is checked. check=None (fixtures, history)
+    trusts the `ran` call instead. Calls that do the task, or write its result, never re-trigger it.
+
+    Returns {"status": idle|due|pending|done|paused, "batch", "trigger", "ran", "failed", "notes"}.
+    `notes` lists the user's skip/pause/resume events that took effect, as (action, index)."""
+    req = rule["require"]
+    result_path = (req.get("done_when") or {}).get("newer")
+    batch = last = None   # first and latest trigger of the open batch
+    closed = None         # (first trigger, latest trigger, ran index) of the batch handled last
+    paused, notes, prev_claude = False, [], None
+    for k, e in enumerate(events):
+        if e[0] == "@claude":
+            prev_claude = str(e[1].get("text", ""))
+        c = control(e, rule["id"])
+        if c:
+            action, explicit = c
+            if action == "pause" and not paused:
+                paused = True
+                notes.append(("pause", k))
+            elif action == "resume" and paused:
+                paused = False
+                notes.append(("resume", k))
+            elif action == "skip" and (batch is not None or (explicit and closed)):
+                batch = last = closed = None
+                notes.append(("skip", k))
+            continue
+        if not e[0].startswith("@") and any_matches(req["ran"], e[0], e[1], cwd):
+            if batch is not None:
+                closed, batch, last = (batch, last, k), None, None
+            elif closed:
+                closed = (closed[0], closed[1], k)  # another try at the same batch
+            continue
+        if any_matches(req.get("after"), e[0], e[1], cwd, prev_claude) and not (
+                result_path and writes_to(e, result_path, cwd)):
+            batch = k if batch is None else batch
+            last = k
+    state = {"status": "idle", "batch": None, "trigger": None, "ran": None, "failed": False, "notes": notes}
+    if paused:
+        state["status"] = "paused"
+        return state
+    if batch is not None:
+        state.update(batch=batch, trigger=last)
+        state["status"] = "done" if check and check(events[last]) else "due"
+    elif closed:
+        first, last, ran = closed
+        state.update(batch=first, trigger=last, ran=ran)
+        if check is None or check(events[last]):
+            state["status"] = "done"
+        else:
+            slow = req.get("slow_minutes")
+            started = events[ran][2]
+            waiting = slow and started and now and now - started < _dt.timedelta(minutes=float(slow))
+            state["status"] = "pending" if waiting else "due"
+            state["failed"] = not waiting
+    return state
 
 
 def stop_gate_unmet(rule, calls, cwd):
-    """True when an `after` call happened and no `ran` call followed the last one."""
-    req = rule["require"]
-    last_after = -1
-    for i, (name, inp) in enumerate(calls):
-        if call_matches(req["after"], name, inp, cwd):
-            last_after = i
-    if last_after < 0:
-        return False
-    return not any(call_matches(req["ran"], n, i, cwd) for n, i in calls[last_after + 1:])
+    """True when an `after` call happened and no `ran` call followed it."""
+    events = [(c[0], c[1], c[2] if len(c) > 2 else None) for c in calls]
+    return duty_state(rule, events, cwd)["status"] == "due"
+
+
+def result_check(rule, cwd):
+    """The live check behind `done_when`: (trigger_event) -> bool. Records what it saw in .detail."""
+    done = rule["require"].get("done_when")
+    if not done:
+        return None
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or cwd
+
+    def check(trigger):
+        if done.get("newer"):
+            path = expand(done["newer"], root)
+            path = path if os.path.isabs(path) else os.path.join(root, path)
+            try:
+                mtime = _dt.datetime.fromtimestamp(os.path.getmtime(path))
+            except OSError:
+                check.detail = f"{done['newer']} does not exist"
+                return False
+            ok = trigger[2] is None or mtime >= trigger[2]
+            check.detail = (f"{os.path.basename(path)} updated {mtime:%H:%M}" if ok else
+                            f"{done['newer']} is older ({mtime:%H:%M}) than the last change ({trigger[2]:%H:%M})")
+            return ok
+        import subprocess
+        try:
+            res = subprocess.run(done["command"], shell=True, cwd=root, capture_output=True, text=True,
+                                 timeout=float(done.get("timeout", 10)))
+            ok = res.returncode == 0
+            out = (res.stdout + res.stderr).strip().splitlines()
+            check.detail = f"`{done['command']}` " + ("passed" if ok else f"failed (exit {res.returncode})"
+                                                         + (f": {out[-1][:120]}" if out else ""))
+            return ok
+        except subprocess.TimeoutExpired:
+            check.detail = f"`{done['command']}` timed out"
+            return False
+    check.detail = ""
+    return check
+
+
+def done_description(rule):
+    done = rule["require"].get("done_when") or {}
+    if done.get("newer"):
+        return f"{done['newer']} is newer than the last change"
+    if done.get("command"):
+        return f"`{done['command']}` succeeds"
+    return "the task's command has run"
 
 
 # ---------------------------------------------------------------- evaluation
@@ -770,21 +967,161 @@ def uncommitted(cwd, files):
 TAMPER_RULE = {"id": "forge-tamper", "class": "safety", "decision": "ask"}
 
 
-def evaluate(rules, event, payload, builtin=True):
-    """Pure decision: returns (fired_rules, output_dict_or_None). No side effects."""
+def payload_events(payload):
+    """The session so far as (name, input, time) events: `_calls` (fixtures, backtest) or the transcript."""
+    calls = payload.get("_calls")
+    if calls is None:
+        return transcript_events(payload.get("transcript_path", ""))
+    return [(c[0], c[1], local_time(c[2]) if len(c) > 2 else None) for c in calls]
+
+
+def due_key(armed):
+    return fingerprint(armed[0], armed[1]) + (armed[2].isoformat(timespec="seconds") if armed[2] else "")
+
+
+def as_due(rule, armed, key, attempt=None, failed=False, ran=None, detail=""):
+    """The rule as fired by a due always-rule: its message says what made it due, and what to do now."""
+    at = lambda e: f" at {e[2]:%H:%M}" if e[2] else ""
+    msg = f"{rule['message']} (Due since: {summarise(armed[0], armed[1])[:120]}{at(armed)}.)"
+    if failed and ran:
+        msg += (f" It ran ({summarise(ran[0], ran[1])[:100]}{at(ran)}) but the result is missing: "
+                f"{detail or done_description(rule)}. Find out why and fix it.")
+    elif rule.get("require", {}).get("slow_minutes"):
+        msg += (" This takes a while: start it in the background (run_in_background), tell the user it is running, "
+                "and check the result when it finishes.")
+    if attempt == ATTEMPTS:
+        msg += " This is the last attempt: if it fails again, stop and tell the user what failed and what you tried."
+    return {**rule, "_due": key, "message": msg}
+
+
+CONTROL_NOTES = {
+    "skip": "⏭ Skipped always-rule {id} for these changes, as you asked.",
+    "pause": "⏸ always-rule {id} is paused for this session. Say /always resume {id} to turn it back on.",
+    "resume": "▶ always-rule {id} is back on.",
+}
+NO_MEMO = {"seen": set(), "attempts": {}, "noted": set(), "confirmed": set(), "handed": set()}
+
+
+def duty_memo(entries, session):
+    """What the ledger says about this session's always-rules: reminders already given, blocks per batch
+    since it was last confirmed done, notes already shown, batches confirmed done, batches handed over."""
+    memo = {k: (dict() if k == "attempts" else set()) for k in NO_MEMO}
+    for e in entries:
+        if e.get("session") != session:
+            continue
+        rk = (e.get("rule"), e.get("due") or e.get("key"))
+        kind = e.get("kind")
+        if kind == "fire" and e.get("due"):
+            if e.get("event") == "PostToolUse":
+                memo["seen"].add(rk)
+            elif e.get("event") == "Stop":
+                memo["attempts"][rk] = memo["attempts"].get(rk, 0) + 1
+                memo["confirmed"].discard(rk)
+        elif kind == "done":
+            memo["attempts"][rk] = 0
+            memo["confirmed"].add(rk)
+            memo["handed"].discard(rk)
+        elif kind == "handoff":
+            memo["handed"].add(rk)
+        elif kind == "note":
+            memo["noted"].add(rk)
+    return memo
+
+
+def fixed_check(value):
+    def check(_trigger):
+        return value
+    check.detail = ""
+    return check
+
+
+def check_for(rule, payload, cwd):
+    """Fixtures may pin the result (`done`); fixtures and history otherwise trust the `ran` call; a live
+    hook checks the real result."""
+    if "_result" in payload:
+        return fixed_check(bool(payload["_result"])) if rule["require"].get("done_when") else None
+    if "_calls" in payload:
+        return None
+    return result_check(rule, cwd)
+
+
+def evaluate_stop(active, payload, cwd, now, memo):
+    events = payload_events(payload) if active else []
+    fired, notes, log = [], [], []
+    for r in active:
+        check = check_for(r, payload, cwd)
+        st = duty_state(r, events, cwd, now, check)
+        for action, k in st["notes"]:
+            nk = due_key(events[k])
+            if (r["id"], nk) not in memo["noted"]:
+                notes.append(CONTROL_NOTES[action].format(id=r["id"]))
+                log.append({"kind": "note", "rule": r["id"], "note": action, "key": nk})
+        if st["status"] not in ("due", "done"):
+            continue
+        key = due_key(events[st["batch"]])
+        rk = (r["id"], key)
+        if st["status"] == "done":
+            if check and rk not in memo["confirmed"]:
+                notes.append(f"✓ always-rule {r['id']}: done ({check.detail or done_description(r)})")
+                log.append({"kind": "done", "rule": r["id"], "key": key})
+            continue
+        tries = memo["attempts"].get(rk, 0)
+        detail = check.detail if check else ""
+        if tries >= ATTEMPTS:  # handed to the user: remind at every reply's end, never block again
+            notes.append(f"⚠ always-rule {r['id']} is still not done after {ATTEMPTS} attempts"
+                         f" ({detail or 'not done'}). It stays on the list until it is done, "
+                         f"or you say /always skip {r['id']}.")
+            if rk not in memo["handed"]:
+                log.append({"kind": "handoff", "rule": r["id"], "key": key})
+            continue
+        ran = events[st["ran"]] if st["ran"] is not None else None
+        fired.append(as_due(r, events[st["batch"]], key, tries + 1, st["failed"], ran, detail))
+    out = {}
+    if fired:
+        out.update(decision="block", reason=join_messages(fired))
+    if notes:
+        out["systemMessage"] = "\n".join(notes)
+    if log:
+        out["_log"] = log
+    return fired, out or None
+
+
+def evaluate(rules, event, payload, builtin=True, memo=None):
+    """Pure decision: returns (fired_rules, output_dict_or_None). No side effects; what the hook should
+    log comes back under the output's "_log" key. `memo` is the ledger's view of this session's
+    always-rules (duty_memo); without it every always-rule starts fresh."""
+    memo = memo or NO_MEMO
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input") or {}
+    now = local_time(payload.get("_now"))
     active = [r for r in rules if r.get("event") == event and not r.get("disabled")]
     if event == "Stop":
-        calls = payload.get("_calls")
-        if calls is None:
-            calls = transcript_calls(payload.get("transcript_path", ""))
-        fired = [r for r in active if stop_gate_unmet(r, calls, cwd)]
-        if not fired:
-            return [], None
-        return fired, {"decision": "block", "reason": join_messages(fired)}
+        return evaluate_stop(active, payload, cwd, now, memo)
     fired = [r for r in active if call_matches(r, tool_name, tool_input, cwd)]
+    if any(r.get("require") for r in fired):  # always-rules: this call is allowed only once the task is done
+        prior = payload_events(payload)
+        if prior and prior[-1][:2] == (tool_name, tool_input):  # the transcript may already hold this call
+            prior = prior[:-1]
+        current = (tool_name, tool_input, now)
+        keep = []
+        for r in fired:
+            req = r.get("require")
+            if not req:
+                keep.append(r)
+                continue
+            if not req.get("after"):  # no trigger: the task must have been done once this session before this call
+                if not any(any_matches(req["ran"], n, i, cwd) for n, i, _ in prior):
+                    keep.append(as_due(r, current, due_key(current)))
+                continue
+            # an order gate judges the calls before this one; a reminder includes the call that just ran
+            events = prior + [current] if event == "PostToolUse" else prior
+            st = duty_state(r, events, cwd, now, check_for(r, payload, cwd))
+            if st["status"] == "due":
+                key = due_key(events[st["batch"]])
+                if (r["id"], key) not in memo["seen"]:
+                    keep.append(as_due(r, events[st["batch"]], key))
+        fired = keep
     if event == "PreToolUse":
         cmd = tool_input.get("command") if isinstance(tool_input.get("command"), str) else ""
         unknown = bash_unknown_writes(cmd) if cmd else []
@@ -903,17 +1240,17 @@ def hook(event):
         fp = fingerprint(tool_name, tool_input) if event != "Stop" else ""
         if event == "PostToolUse":
             mark_approvals(p, session, fp)
-        fired, out = evaluate(rules, event, payload)
-        if event == "Stop" and fired:
-            blocks = sum(1 for e in ledger_read(p, tail=True) if e.get("session") == session and e.get("event") == "Stop"
-                         and e.get("kind") == "fire")
-            if payload.get("stop_hook_active") and blocks >= MAX_STOP_BLOCKS:
-                for r in fired:
-                    ledger_append(p, {"kind": "gave_up", "rule": r["id"], "event": event, "session": session})
-                return 0
+        payload["_now"] = _dt.datetime.now()
+        memo = None
+        if any(r.get("require") and r.get("event") == event for r in rules):
+            memo = duty_memo(ledger_read(p, tail=True), session)
+        fired, out = evaluate(rules, event, payload, memo=memo)
+        for entry in (out or {}).pop("_log", []):
+            ledger_append(p, {**entry, "event": event, "session": session})
         for r in fired:
             ledger_append(p, {"kind": "fire", "rule": r["id"], "event": event, "decision": r["decision"],
-                              "session": session, "fp": fp, "input": summarise(tool_name, tool_input)})
+                              "session": session, "fp": fp, "input": summarise(tool_name, tool_input),
+                              **({"due": r["_due"]} if r.get("_due") else {})})
         if event == "PostToolUse" and fired:
             cwd = payload.get("cwd") or os.getcwd()
             notes = run_fixers(fired, tool_input, cwd)
@@ -960,23 +1297,56 @@ def validate(rule, existing_ids=()):
     prov = rule.get("provenance") or {}
     if not prov.get("said") or not prov.get("date"):
         errs.append("provenance.said (the user's words) and provenance.date are required")
-    specs = []
+    checked = []
+    req = rule.get("require")
     if event in ("PreToolUse", "PostToolUse"):
-        if not rule.get("match"):
-            errs.append("match is required for tool events")
-        specs.append(rule)
-    if event == "Stop":
-        req = rule.get("require") or {}
-        if not (isinstance(req.get("after"), dict) and isinstance(req.get("ran"), dict)):
-            errs.append("Stop rules need require.after and require.ran, each {tool, match}")
+        if not rule.get("match") and not (event == "PostToolUse" and req):
+            errs.append("match is required for tool events (a PostToolUse duty may omit it to check after every call)")
+        checked.append(rule)
+    if event == "Stop" and not req:
+        errs.append("Stop rules need require: {after, ran}")
+    if req is not None:
+        def spec_list(v):
+            return isinstance(v, (dict, list)) and all(isinstance(s, dict) for s in specs(v)) and bool(specs(v))
+        if not isinstance(req, dict) or not spec_list(req.get("ran")):
+            errs.append("require.ran is required: {tool, match} or a list of them")
+        elif "after" in req and not spec_list(req["after"]):
+            errs.append("require.after must be {tool, match} or a list of them")
         else:
-            specs += [req["after"], req["ran"]]
+            checked += specs(req.get("after")) + specs(req["ran"])
+            if event in ("Stop", "PostToolUse") and not req.get("after"):
+                errs.append("this always-rule needs require.after: what makes the task due")
+            if "at" in req or "within_minutes" in req:
+                errs.append("time-based rules (at, within_minutes) were removed in 3.0: use /schedule or /loop")
+            unknown = set(req) - {"after", "ran", "done_when", "slow_minutes"}
+            if unknown:
+                errs.append(f"unknown require field(s): {', '.join(sorted(unknown))}")
+            done = req.get("done_when")
+            if done is not None:
+                kinds = [k for k in ("newer", "command") if isinstance(done, dict) and isinstance(done.get(k), str)
+                         and done[k].strip()]
+                if len(kinds) != 1:
+                    errs.append('require.done_when must be {"newer": "<file>"} or {"command": "<shell check>"}')
+                t = done.get("timeout", 10) if isinstance(done, dict) else 10
+                if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= 20:
+                    errs.append("require.done_when.timeout must be 1-20 seconds: the check runs at every reply's end")
+            sm = req.get("slow_minutes")
+            if sm is not None:
+                if isinstance(sm, bool) or not isinstance(sm, (int, float)) or sm <= 0:
+                    errs.append("require.slow_minutes must be a positive number")
+                elif not done:
+                    errs.append("require.slow_minutes needs done_when: a background run is judged by its result")
+            if rule.get("unknown_writes"):
+                errs.append("unknown_writes cannot be combined with require")
     regexes = []
-    for spec in specs:
+    for spec in checked:
         try:
             re.compile(spec.get("tool", ".*"))
             regexes.append(spec.get("tool", ".*"))
-            for pat in list((spec.get("match") or {}).values()) + list((spec.get("unless") or {}).values()):
+            if spec.get("replying_to") and not str(spec["replying_to"]).startswith("re:"):
+                errs.append("replying_to must be a re: pattern on what Claude wrote last")
+            extra = [spec["replying_to"]] if str(spec.get("replying_to", "")).startswith("re:") else []
+            for pat in list((spec.get("match") or {}).values()) + list((spec.get("unless") or {}).values()) + extra:
                 kind, _, body = str(pat).partition(":")
                 if kind not in ("glob", "re", "cmd"):
                     errs.append(f"pattern {pat!r} must start with glob:, re:, or cmd:")
@@ -1029,12 +1399,22 @@ def regex_is_slow(pattern, limit=1.5):
         return True
 
 
+def fixture_event(c):
+    """A fixture transcript entry: a tool call, {"user": text}, or {"claude": text}; optional "at": when."""
+    if "user" in c or "claude" in c:
+        who = "user" if "user" in c else "claude"
+        return ("@" + who, {"text": str(c[who])}, c.get("at"))
+    return (c.get("tool_name", ""), c.get("tool_input") or {}, c.get("at"))
+
+
 def fixture_payload(rule, fx):
-    if rule["event"] == "Stop":
-        return {"_calls": [(c.get("tool_name", ""), c.get("tool_input") or {}) for c in fx.get("transcript", [])],
-                "cwd": fx.get("cwd", "/project")}
-    return {"tool_name": fx.get("tool_name", ""), "tool_input": fx.get("tool_input") or {},
-            "cwd": fx.get("cwd", "/project")}
+    payload = {"_calls": [fixture_event(c) for c in fx.get("transcript", [])], "cwd": fx.get("cwd", "/project"),
+               "_now": fx.get("now")}
+    if "done" in fx:  # pins an always-rule's result check (done_when) for this fixture
+        payload["_result"] = fx["done"]
+    if rule["event"] != "Stop":
+        payload.update(tool_name=fx.get("tool_name", ""), tool_input=fx.get("tool_input") or {})
+    return payload
 
 
 def run_suite(rules):
@@ -1046,7 +1426,11 @@ def run_suite(rules):
             for i, case in enumerate(fx.get(kind, [])):
                 checks += 1
                 fired, _ = evaluate(rules, rule["event"], fixture_payload(rule, case), builtin=False)
-                ids = [r["id"] for r in fired]
+                # an always-rule that holds the reply's end or only reminds blocks no call, so it cannot
+                # contradict another rule's examples: a session can do both
+                ids = [r["id"] for r in fired if r["id"] == rule["id"] or not (
+                    r.get("require") and (r["event"] == "Stop" or r["decision"] == "nudge")
+                    or rule["event"] == "Stop")]
                 label = f"{rule['id']} {kind}[{i}] {describe(case)}"
                 if kind == "bad" and rule["id"] not in ids:
                     failures.append(f"MISSED   {label}: rule did not fire")
@@ -1054,14 +1438,68 @@ def run_suite(rules):
                     for other in ids:
                         tag = "TOO-BROAD" if other == rule["id"] else "CONFLICT "
                         failures.append(f"{tag} {label}: fired by {other}")
-    return checks, failures
+                if kind == "good" and rule.get("require"):
+                    failures += [f"CONFLICT {label}: the duty is done by {what}, which {other} blocks"
+                                 for what, other in duty_blocked(rules, rule, case)]
+    return checks, failures + loop_failures(rules)
+
+
+def task_calls(rule):
+    """The calls that do an always-rule's task: its `ran` calls in good fixtures, plus writing its result."""
+    req = rule["require"]
+    calls = [fixture_event(c) for case in (rule.get("fixtures") or {}).get("good", [])
+             for c in case.get("transcript", []) if not str(c.get("tool_name", "@")).startswith("@")]
+    calls = [c for c in calls if any_matches(req["ran"], c[0], c[1], "/project")]
+    if (req.get("done_when") or {}).get("newer"):
+        calls.append(("Write", {"file_path": req["done_when"]["newer"]}, None))
+    return calls
+
+
+def loop_failures(rules):
+    """Two always-rules whose tasks trigger each other would run forever: A's task makes B due and B's
+    task makes A due. (A rule's own task never re-triggers itself; duty_state skips those calls.)"""
+    duties = [r for r in rules if r.get("require") and r["require"].get("after")]
+
+    def feeds(a, b):
+        req = b["require"]
+        return next((c for c in task_calls(a) if any_matches(req["after"], c[0], c[1], "/project")
+                     and not any_matches(req["ran"], c[0], c[1], "/project")), None)
+    out = []
+    for i, a in enumerate(duties):
+        for b in duties[i + 1:]:
+            ab, ba = feeds(a, b), feeds(b, a)
+            if ab and ba:
+                out.append(f"LOOP     {a['id']} <-> {b['id']}: {a['id']}'s task ({summarise(ab[0], ab[1])[:60]}) "
+                           f"makes {b['id']} due, and {b['id']}'s task ({summarise(ba[0], ba[1])[:60]}) makes "
+                           f"{a['id']} due, forever. Keep one, or narrow a trigger so it ignores the other's output.")
+    return out
+
+
+def duty_blocked(rules, rule, case):
+    """A duty contradicts a rule that always denies the very call that does the duty (e.g. "commit after
+    every change" next to "never commit"). An order rule ("test before commit") only sequences it, so it
+    is left out. Checks each `ran` call in a good fixture's transcript."""
+    events = [fixture_event(c) for c in case.get("transcript", [])]
+    if rule["event"] != "Stop" and case.get("tool_name"):
+        events.append((case["tool_name"], case.get("tool_input") or {}, case.get("now")))
+    cwd = case.get("cwd", "/project")
+    out = []
+    for k, (name, inp, ts) in enumerate(events):
+        if name.startswith("@") or not any_matches(rule["require"]["ran"], name, inp, cwd):
+            continue
+        fired, _ = evaluate([r for r in rules if r["id"] != rule["id"] and not r.get("require")], "PreToolUse",
+                            {"tool_name": name, "tool_input": inp, "_calls": events[:k], "_now": ts, "cwd": cwd},
+                            builtin=False)
+        out += [(summarise(name, inp), r["id"]) for r in fired if r["decision"] == "deny"]
+    return out
 
 
 def describe(case):
+    done = summarise(case.get("tool_name", ""), case.get("tool_input") or {}) if "tool_name" in case else ""
     if "transcript" in case:
-        return "transcript[" + ", ".join(summarise(c.get("tool_name", ""), c.get("tool_input") or {})
-                                        for c in case["transcript"]) + "]"
-    return summarise(case.get("tool_name", ""), case.get("tool_input") or {})
+        before = "transcript[" + ", ".join(summarise(*fixture_event(c)[:2]) for c in case["transcript"]) + "]"
+        return f"{before} then {done}" if done else before
+    return done
 
 
 # ---------------------------------------------------------------- settings
@@ -1232,7 +1670,8 @@ def cmd_doctor(_args):
 
 CORRECTION_RE = re.compile(
     r"(?i)\b(don'?t|do not|never|stop|always|again|i told you|i said|not what i|instead of|you keep|wrong|"
-    r"shouldn'?t|should not|please don'?t|no,)\b|لا ت|أبدا|ابدا|دائما|توقف|مرة أخرى")
+    r"shouldn'?t|should not|please don'?t|no,|every time|each time|whenever|after every|before you)\b"
+    r"|لا ت|أبدا|ابدا|دائما|توقف|مرة أخرى|كل مرة|بعد كل|قبل كل")
 STOPWORDS = set("the a an and or to of in on for with this that it is are be you your me my i we do don't dont not "
                 "never always again stop please just can could would should about from at as by was were have has "
                 "what when then than there here they them so if but no yes ok".split())
@@ -1286,52 +1725,91 @@ def transcripts_dir_for(project):
 MAX_BACKTEST_CALLS = 50000
 
 
-def history_calls(dirs):
-    """Every tool call Claude made in past sessions: (date, session, cwd, tool_name, tool_input).
-    Deduplicated by tool_use id, since resumed and forked sessions copy earlier turns."""
+def history_calls(dirs, text=False):
+    """Every tool call Claude made in past sessions: (date, session, cwd, tool_name, tool_input, time).
+    With text, also what the user and Claude wrote, as @user / @claude events (duties need them).
+    Deduplicated by tool_use id (or line uuid), since resumed and forked sessions copy earlier turns."""
     calls, seen = [], set()
     files = sorted((f for d in dirs for f in glob_files(d, recursive=True)), key=lambda f: os.path.getmtime(f))
     for path in files[-400:]:
         try:
             with open(path, encoding="utf-8") as f:
                 for line in f:
-                    if '"tool_use"' not in line:
+                    if '"tool_use"' not in line and not (text and '"text"' in line or text and '"user"' in line):
                         continue
                     try:
                         e = json.loads(line)
                     except ValueError:
                         continue
-                    msg = e.get("message") if isinstance(e.get("message"), dict) else {}
-                    for b in msg.get("content") or []:
-                        if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") not in seen:
-                            seen.add(b.get("id"))
-                            calls.append((e.get("timestamp", "")[:10], e.get("sessionId", "")[:8],
-                                          e.get("cwd", ""), b.get("name", ""), b.get("input") or {}))
+                    if not isinstance(e, dict):
+                        continue
+                    if text and e.get("uuid"):
+                        if e["uuid"] in seen:
+                            continue
+                        seen.add(e["uuid"])
+                    blocks = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+                    ids = [b.get("id") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"] \
+                        if isinstance(blocks, list) else []
+                    k = 0
+                    for name, inp, ts in entry_events(e):
+                        if not name.startswith("@"):
+                            tid, k = (ids[k] if k < len(ids) else None), k + 1
+                            if tid in seen:
+                                continue
+                            seen.add(tid)
+                        elif not text:
+                            continue
+                        calls.append((e.get("timestamp", "")[:10], e.get("sessionId", "")[:8],
+                                      e.get("cwd", ""), name, inp, ts))
         except OSError:
             continue
     return calls[-MAX_BACKTEST_CALLS:]
+
+
+def tool_calls_only(calls):
+    return [c for c in calls if not c[3].startswith("@")]
 
 
 def backtest(rule, calls):
     """Replay one rule over past tool calls. Returns (hits, sessions_seen) where each hit is
     (date, session, summary). Stop rules are judged per session, at its end."""
     hits = []
-    if rule["event"] == "Stop":
-        by_session = {}
-        for date, sid, cwd, name, inp in calls:
-            by_session.setdefault(sid, (date, cwd, []))[2].append((name, inp))
-        for sid, (date, cwd, seq) in by_session.items():
-            if stop_gate_unmet(rule, seq, cwd or "/"):
-                armed = [c for c in seq if call_matches(rule["require"]["after"], c[0], c[1], cwd or "/")][-1]
-                hits.append((date, sid, f"finished after {summarise(*armed)} with no matching run after it",
-                             armed[0], armed[1]))
-        return hits, len(by_session)
-    for date, sid, cwd, name, inp in calls:
+    if rule.get("require"):
+        return backtest_duty(rule, calls)
+    for date, sid, cwd, name, inp, _ts in tool_calls_only(calls):
         fired, _ = evaluate([rule], rule["event"], {"tool_name": name, "tool_input": inp, "cwd": cwd or "/"},
                             builtin=False)
         if fired:
             hits.append((date, sid, hit_summary(rule, name, inp, cwd or "/"), name, inp))
     return hits, len({c[1] for c in calls})
+
+
+def backtest_duty(rule, calls):
+    """Replay a duty session by session, in order. A Stop duty is judged where each turn ends (the user
+    speaks again) and at the session's end; a tool-event duty at each matching call. One hit per trigger."""
+    by_session = {}
+    for date, sid, cwd, name, inp, ts in calls:
+        by_session.setdefault(sid, (date, cwd, []))[2].append((name, inp, ts))
+    hits = []
+    for sid, (date, cwd, seq) in by_session.items():
+        reported = set()
+        ends = [k for k in range(1, len(seq)) if seq[k][0] == "@user"] + [len(seq)]
+        points = ends if rule["event"] == "Stop" else [k for k, e in enumerate(seq) if not e[0].startswith("@")]
+        for k in points:
+            payload = {"_calls": seq[:k], "cwd": cwd or "/", "_now": seq[k - 1][2] if k else None}
+            if rule["event"] != "Stop":
+                payload.update(tool_name=seq[k][0], tool_input=seq[k][1], _now=seq[k][2])
+            fired, _ = evaluate([rule], rule["event"], payload, builtin=False)
+            for r in fired:
+                if r["_due"] in reported:
+                    continue
+                reported.add(r["_due"])
+                since = re.search(r"\(Due since: (.*?)\.\)", r["message"]).group(1)
+                what = "turn ended" if rule["event"] == "Stop" else summarise(seq[k][0], seq[k][1])[:60]
+                context = [e[:2] for e in seq[max(0, k - 8):k]]
+                hits.append((date, sid, f"{what}; due since {since}", *(seq[k][:2] if k < len(seq) else ("", {})),
+                             context))
+    return hits, len(by_session)
 
 
 def hit_summary(rule, name, inp, cwd):
@@ -1369,7 +1847,8 @@ EVIDENCE_LOW = 20
 def rule_surface(rule):
     """A rule's area: its tools, the command heads its bad fixtures use, and the directory above the
     paths it protects. Exposure = how many past calls happened in that area."""
-    spec = rule["require"]["after"] if rule["event"] == "Stop" else rule
+    req = rule.get("require") or {}
+    spec = (specs(req.get("after")) or specs(req.get("ran")))[0] if rule["event"] == "Stop" else rule
     heads, parent = set(), None
     for fx in (rule.get("fixtures") or {}).get("bad", []):
         calls = [(c.get("tool_name"), c.get("tool_input") or {}) for c in fx.get("transcript", [])] or \
@@ -1479,8 +1958,8 @@ def corpus_hits(rule, corpus, root):
 def run_backtest(rule, history, corpus, root):
     hits, sessions = backtest(rule, history)
     surface = rule_surface(rule)
-    exposure = sum(1 for _d, _s, cwd, name, inp in history if on_surface(surface, name, inp, cwd or root))
-    return {"history_calls": len(history), "sessions": sessions, "exposure": exposure,
+    exposure = sum(1 for _d, _s, cwd, name, inp, _t in history if on_surface(surface, name, inp, cwd or root))
+    return {"history_calls": len(tool_calls_only(history)), "sessions": sessions, "exposure": exposure,
             "evidence": evidence_label(exposure), "hits": hits, "corpus": corpus_hits(rule, corpus, root)}
 
 
@@ -1524,12 +2003,14 @@ def cmd_backtest(args):
     root = os.path.abspath(arg_value(args, "--project-dir", os.path.dirname(os.path.dirname(HERE))))
     os.environ.setdefault("CLAUDE_PROJECT_DIR", root)
     rules = load_rules(paths(), log=False) if args[0] == "--all" else [read_rule_arg(args[0])]
-    history = history_calls(default_history_dirs(args))
+    history = history_calls(default_history_dirs(args), text=any(r.get("require") for r in rules))
     corpus = corpus_calls(root)
     for rule in rules:
         result = run_backtest(rule, history, corpus, root)
         if "--fixtures" in args:  # every hit as a ready-to-paste fixture, for the human to label bad or near_miss
-            found = [{"tool_name": h[3], "tool_input": h[4], "_seen": f"history {h[0]}"} for h in result["hits"]]
+            found = [{**({"transcript": [{"tool_name": n, "tool_input": i} for n, i in h[5]]} if len(h) > 5 else {}),
+                      **({"tool_name": h[3], "tool_input": h[4]} if h[3] else {}), "_seen": f"history {h[0]}"}
+                     for h in result["hits"]]
             found += [{"tool_name": n, "tool_input": i, "_seen": src} for src, _s, n, i in result["corpus"]]
             print(json.dumps({"rule": rule["id"], "hits_as_fixtures": found}, indent=1, ensure_ascii=False))
         else:
@@ -1571,6 +2052,9 @@ def cmd_harvest(args):
             kinds.append("command rule (`cmd:` on `command`)")
         if re.search(r"\b(test|tests|done|finish|before you)\b", text, re.I):
             kinds.append("stop gate")
+        if re.search(r"\b(always|every time|each time|whenever|after (every|each)|before (every|each))\b"
+                     r"|كل مرة|بعد كل|قبل كل|دائما", text, re.I):
+            kinds.append("always-rule (/always)")
         print(f"\n{len(c[1])}x across {sessions} session(s); likely {' or '.join(kinds) or 'prose'}:")
         for date, _, text in c[1][:3]:
             print(f"   {date}  \"{redact(' '.join(text.split()))[:160]}\"")
@@ -1606,7 +2090,8 @@ def cmd_add(args):
     if "--no-backtest" not in args:
         root = os.path.abspath(arg_value(args, "--project-dir", os.path.dirname(os.path.dirname(HERE))))
         os.environ.setdefault("CLAUDE_PROJECT_DIR", root)
-        result = run_backtest(rule, history_calls(default_history_dirs(args)), corpus_calls(root), root)
+        result = run_backtest(rule, history_calls(default_history_dirs(args), text=bool(rule.get("require"))),
+                              corpus_calls(root), root)
         print(backtest_report(rule, result, limit=3))
         rule.setdefault("provenance", {})["backtest"] = {  # travels with rules.json to teammates
             "date": iso()[:10], "history_calls": result["history_calls"], "exposure": result["exposure"],
@@ -1680,12 +2165,29 @@ def cmd_remove(args):
     return 0
 
 
-def cmd_list(_args):
-    rules = load_json(paths()["rules"], [])
-    if not rules:
-        print("No guardrails yet.")
-    for r in rules:
-        print(f"{r['id']:<28} {r['class']:<10} {r['event']:<11} {r['decision']:<6} {r['message'][:70]}")
+LAST_STATE = {"done": "last done {ts}", "handoff": "handed to the user {ts} (still not done)",
+              "fire": "last due {ts}", "note": "{note} {ts}"}
+
+
+def cmd_list(args):
+    """forge.py list [--always]: every rule; --always shows only always-rules, with their last state."""
+    p = paths()
+    rules = load_json(p["rules"], [])
+    only_always = "--always" in args
+    shown = [r for r in rules if r.get("require") or not only_always]
+    if not shown:
+        print("No always-rules yet. Create one with /always <what Claude should always do>." if only_always
+              else "No guardrails yet.")
+    ledger = ledger_read(p, tail=False) if only_always else []
+    for r in shown:
+        kind = "always" if r.get("require") else "never"
+        print(f"{r['id']:<28} {kind:<6} {r['class']:<10} {r['event']:<11} {r['decision']:<6} {r['message'][:70]}")
+        if only_always:
+            mine = [e for e in ledger if e.get("rule") == r["id"] and e.get("kind") in LAST_STATE]
+            last = mine[-1] if mine else None
+            state = (LAST_STATE[last["kind"]].format(ts=str(last.get("ts", ""))[:16].replace("T", " "),
+                                                     note=last.get("note", "")) if last else "not due yet")
+            print(f"{'':<28} done when {done_description(r)}; {state}")
     return 0
 
 
@@ -1795,7 +2297,7 @@ def sandbox_impact(root):
     calls = [c for c in history_calls([transcripts_dir_for(root)]) if c[3] == "Bash"]
     outside, network = [], []
     real_root = os.path.realpath(root)
-    for date, sid, cwd, name, inp in calls:
+    for date, sid, cwd, name, inp, _ts in calls:
         cmd = inp.get("command", "")
         for t, _ in bash_writes(cmd):
             target = os.path.realpath(os.path.join(cwd or root, expand(t, cwd or root)))

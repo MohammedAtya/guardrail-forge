@@ -1,11 +1,15 @@
 ---
 name: forge
-description: Forge a user's correction into an enforced guardrail (hook, permission deny, or stop gate) proven by fixtures, instead of a CLAUDE.md line. Use when the user types /forge, corrects a repeated mistake ("don't do that again", "never X", "always Y", "stop doing Z"), or asks to audit, list, or remove guardrails.
+description: Forge a user's correction into an enforced never-rule (hook, permission deny, or stop gate) proven by fixtures, instead of a CLAUDE.md line. Use when the user types /forge, corrects a repeated mistake ("don't do that again", "never X", "stop doing Z"), or asks to audit, list, or remove guardrails. For "always do X after/before Y", use the /always skill.
 ---
 
 # Forge
 
 Turn a **correction** into a **guardrail**: the strongest cheap enforcement that will not misfire, proven **red/green** by fixtures before it is installed, and logged to a **ledger** every time it fires.
+
+A guardrail works in one of two directions:
+- **Never-rule** (this skill): "never X", "stop doing X". Claude is blocked, asked about, or nudged when it tries X.
+- **Always-rule** (the `/always` skill, `<skill-dir>/../always/SKILL.md`): "after X, always do Y", "before X, do Y". Claude cannot finish its reply, or take the next step, until Y is really done. When a correction is really a standing task ("you forgot to rebuild again"), follow that skill instead; it uses the same engine.
 
 `<skill-dir>` below is the base directory shown when this skill loads. `<guardrails>` is the installed scope: `<project>/.claude/guardrails/` or `~/.claude/guardrails/`.
 
@@ -85,7 +89,8 @@ Read the verdict:
 - `GREEN` then `Added` → done. It also prints the backtest summary, a `PROMPT BUDGET` note for ask rules, and a `SANDBOX LOCK` line for locked rules; relay any of these to the user.
 - `MISSED` → the pattern is too narrow for a bad fixture. Widen it.
 - `TOO-BROAD` → the rule fires on its own good/near-miss fixture. Narrow it or add `unless`.
-- `CONFLICT` → the rule fires on another rule's good fixture. Show the user both rules and ask which wins.
+- `CONFLICT` → the rule fires on another rule's good fixture, or blocks the call an always-rule needs ("never commit" next to "always commit after every update"). Show the user both rules and ask which wins. Always-rules that only hold the reply's end or remind never conflict with other rules' examples.
+- `LOOP` → two always-rules would trigger each other forever. Ask the user which to keep.
 - `INVALID RULE` → fix the listed fields.
 
 A fixture encodes the user's intent, so fix the rule until green. Changing a fixture needs the user's say-so.
@@ -125,7 +130,7 @@ Change only what the user picks. Re-adding an edited rule = `remove`, then `add`
 
 ## Manage
 
-- `forge.py list`: every rule with class, event, and decision.
+- `forge.py list`: every rule with kind (never/always), class, event, and decision. `list --always` adds each always-rule's last state.
 - `forge.py doctor`: hooks registered, dispatcher current, no `disableAllHooks`, suite green, sandbox lock consistent and runnable, recent errors.
 - `forge.py backtest <rule.json>|--all`: replay rules over every tool call in past sessions.
 - `forge.py sandbox status|on|off|exclude "CMD"`: the OS-level lock (see **Sandbox lock**).
@@ -135,4 +140,4 @@ Change only what the user picks. Re-adding an edited rule = `remove`, then `add`
 
 ## Limits to state honestly
 
-Guardrails catch Claude's habits, not a determined adversary: a pattern can be routed around. That is why safety rules carry a `permission_deny` second layer. Hooks see tool calls only; a rule about how Claude talks or plans belongs on the prose rung. Scripts run from a file (`python3 tool.py`, `make x`) are opaque to hooks: the sandbox lock covers them for path rules where the machine supports it; otherwise opt a rule into `unknown_writes: "ask"`. A dispatcher bug fails open (logged); an unreadable `rules.json` fails toward the user (mutating calls ask until fixed).
+Guardrails catch Claude's habits, not a determined adversary: a pattern can be routed around. Rules act only while Claude works; anything on a clock ("every day at 9") belongs to `/schedule` or `/loop`. That is why safety rules carry a `permission_deny` second layer. Hooks see tool calls only; a rule about how Claude talks or plans belongs on the prose rung. Scripts run from a file (`python3 tool.py`, `make x`) are opaque to hooks: the sandbox lock covers them for path rules where the machine supports it; otherwise opt a rule into `unknown_writes: "ask"`. A dispatcher bug fails open (logged); an unreadable `rules.json` fails toward the user (mutating calls ask until fixed).

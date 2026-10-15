@@ -403,11 +403,12 @@ class Project(Sandbox):
         t2 = self.write_transcript([("Edit", {"file_path": "app.py"}), ("Bash", {"command": "cd x && pytest -q"})])
         self.assertIsNone(self.hook("stop", {"transcript_path": t2}))
 
-    def test_stop_gate_gives_up_after_three(self):
+    def test_stop_gate_hands_over_after_two_attempts(self):
         self.add(TESTS_GATE)
         t = self.write_transcript([("Edit", {"file_path": "app.py"})])
-        results = [self.hook("stop", {"transcript_path": t, "stop_hook_active": i > 0}) for i in range(5)]
-        self.assertEqual([r is not None for r in results], [True, True, True, False, False])
+        results = [self.hook("stop", {"transcript_path": t, "stop_hook_active": i > 0}) for i in range(4)]
+        self.assertEqual([r.get("decision") for r in results], ["block", "block", None, None])
+        self.assertIn("still not done after 2 attempts", results[3]["systemMessage"])
 
     def test_bad_stdin_fails_open_broken_rules_fail_to_human(self):
         res = self.cli(self.forge, "pre", stdin="{not json")
@@ -773,6 +774,383 @@ class V21(Sandbox):
         self.assertEqual(d(command="python3 .claude/guardrails/forge.py sandbox on"), "pass")
         self.assertEqual(d(command="npm run build", dangerouslyDisableSandbox=True), "ask")
         self.assertEqual(d(command="npm run build"), "pass")
+
+
+# ---------------------------------------------------------------- always-rules: rules that make Claude DO something
+
+WRITES = {"tool": "Edit|Write|MultiEdit|NotebookEdit|Bash", "match": {"path": "glob:**"}}
+COMMIT = {"tool": "Bash", "match": {"command": "cmd:^git commit\\b"}}
+SRC_WRITES = {"tool": "Edit|Write|MultiEdit|Bash", "match": {"path": "glob:src/**"}}
+BUILD = {"tool": "Bash", "match": {"command": "cmd:^(npm run build|make app)\\b"}}
+
+
+def duty(**over):
+    base = {"class": "convention", "event": "Stop", "decision": "block",
+            "provenance": {"said": "do a commit after every update", "date": "2026-10-14"}}
+    base.update(over)
+    return base
+
+
+def at(entry, when):
+    return {**entry, "at": f"2026-10-16T{when}:00"}
+
+
+COMMIT_DUTY = duty(
+    id="commit-after-update", require={"after": WRITES, "ran": COMMIT},
+    message="You changed files and have not committed. Commit them with a message that says what changed.",
+    fixtures={"bad": [{"transcript": [fx("Edit", file_path="app.py")]},
+                      {"transcript": [fx("Edit", file_path="a.py"), fx("Bash", command="git commit -m a"),
+                                      fx("Bash", command="echo x > b.txt")]}],
+              "good": [{"transcript": [fx("Edit", file_path="app.py"), fx("Bash", command="git add -A && git commit -m x")]}],
+              "near_miss": [{"transcript": [fx("Read", file_path="app.py"), fx("Bash", command="git status")]},
+                            {"transcript": [{"user": "what does this repo do?"}]}]})
+
+DECISION_LOG = duty(
+    id="summary-after-decision",
+    require={"after": [{"tool": "@user", "match": {"text": "re:(?i)\\b(let'?s go with|go with|decided|approved)\\b"}},
+                       {"tool": "AskUserQuestion"}],
+             "ran": {"tool": "Edit|Write|Bash", "match": {"path": "glob:**/DECISIONS.md"}}},
+    message="A decision was made. Append a short summary (what, why, alternatives dropped) to DECISIONS.md.",
+    provenance={"said": "write a summary every time after deciding a thing", "date": "2026-10-14"},
+    fixtures={"bad": [{"transcript": [{"user": "ok, let's go with option B"}, fx("Edit", file_path="app.py")]},
+                      {"transcript": [fx("AskUserQuestion", questions=[{"question": "Which DB?"}])]}],
+              "good": [{"transcript": [{"user": "approved"}, fx("Bash", command="cat >> DECISIONS.md <<'EOF'\nB\nEOF")]}],
+              "near_miss": [{"transcript": [{"user": "what options do we have?"}]},
+                            {"transcript": [{"claude": "I decided nothing yet"}]}]})
+
+DESKTOP_BUILD = duty(
+    id="desktop-build", require={"after": SRC_WRITES, "ran": BUILD, "done_when": {"newer": "~/Desktop/app.exe"},
+                                 "slow_minutes": 15},
+    message="The app's code changed. Rebuild it (make app) and copy the exe to ~/Desktop/app.exe.",
+    provenance={"said": "rebuild the exe and send it to the desktop after every change", "date": "2026-10-16"},
+    fixtures={"bad": [{"transcript": [fx("Edit", file_path="src/a.ts")], "done": False},
+                      {"transcript": [at(fx("Edit", file_path="src/a.ts"), "10:00"),
+                                      at(fx("Bash", command="make app && cp out/app.exe ~/Desktop/"), "10:01")],
+                       "now": "2026-10-16T10:30:00", "done": False}],
+              "good": [{"transcript": [fx("Edit", file_path="src/a.ts"), fx("Bash", command="make app")], "done": True},
+                       {"transcript": [fx("Edit", file_path="src/a.ts"),
+                                       fx("Bash", command="node node_modules/x/cli.js && cp out/app.exe ~/Desktop/")],
+                        "done": True}],
+              "near_miss": [{"transcript": [fx("Edit", file_path="tests/a.test.ts")], "done": False},
+                            {"transcript": [at(fx("Edit", file_path="src/a.ts"), "10:00"),
+                                            at(fx("Bash", command="make app"), "10:01")],
+                             "now": "2026-10-16T10:05:00", "done": False}]})
+
+COMMIT_REMINDER = duty(
+    id="commit-reminder", event="PostToolUse", decision="nudge", tool="Edit|Write|MultiEdit|NotebookEdit|Bash",
+    require={"after": WRITES, "ran": COMMIT},
+    message="You have uncommitted changes. Commit them when this step works.",
+    fixtures={"bad": [fx("Edit", file_path="b.py")],
+              "good": [{"transcript": [fx("Edit", file_path="a.py")], **fx("Bash", command="git commit -am a")}],
+              "near_miss": [{"transcript": [fx("Edit", file_path="a.py")], **fx("Read", file_path="a.py")}]})
+
+TESTS_BEFORE_COMMIT = duty(
+    id="tests-before-commit", event="PreToolUse", decision="deny", tool="Bash", match={"command": "cmd:^git commit\\b"},
+    require={"after": {"tool": "Edit|Write|Bash", "match": {"path": "glob:**/*.py"}},
+             "ran": {"tool": "Bash", "match": {"command": "cmd:^(python3? -m )?pytest\\b"}}},
+    message="Python changed since the last test run. Run pytest first, then commit.",
+    provenance={"said": "always run the tests before you commit", "date": "2026-10-14"},
+    fixtures={"bad": [{"transcript": [fx("Edit", file_path="app.py")], **fx("Bash", command="git commit -m x")}],
+              "good": [{"transcript": [fx("Edit", file_path="app.py"), fx("Bash", command="pytest -q")],
+                        **fx("Bash", command="git commit -m x")}],
+              "near_miss": [{"transcript": [fx("Edit", file_path="README.md")], **fx("Bash", command="git commit -m d")},
+                            fx("Bash", command="git commit -m first")]})
+
+DUTIES = [COMMIT_DUTY, DECISION_LOG, DESKTOP_BUILD, COMMIT_REMINDER, TESTS_BEFORE_COMMIT]
+
+
+def ev(name, when=None, **inp):
+    return (name, inp, dt.datetime(2026, 10, 16, *when) if when else None)
+
+
+def said(text, when=None):
+    return ("@user", {"text": text}, dt.datetime(2026, 10, 16, *when) if when else None)
+
+
+class Duties(unittest.TestCase):
+    def test_valid_and_green_together(self):
+        for r in DUTIES:
+            self.assertEqual(forge.validate(r), [], r["id"])
+        checks, fails = forge.run_suite([rule(), NO_NPM, NO_FORCE, PROD_ASK, FMT, TESTS_GATE] + DUTIES)
+        self.assertEqual(fails, [])  # end-of-reply always-rules (tests, commit, build) do not conflict
+        self.assertGreaterEqual(checks, 40)
+
+    def test_rejections(self):
+        req = DESKTOP_BUILD["require"]
+        bad = {
+            "no-ran": duty(id="x1", require={"after": WRITES}, message="m", fixtures=COMMIT_DUTY["fixtures"]),
+            "no-trigger": duty(id="x2", require={"ran": COMMIT}, message="m", fixtures=COMMIT_DUTY["fixtures"]),
+            "time-at": {**COMMIT_DUTY, "require": {**COMMIT_DUTY["require"], "at": "18:00"}},
+            "time-within": {**COMMIT_DUTY, "require": {**COMMIT_DUTY["require"], "within_minutes": 30}},
+            "unknown-field": {**COMMIT_DUTY, "require": {**COMMIT_DUTY["require"], "every": 3}},
+            "after-type": {**COMMIT_DUTY, "require": {"after": "Edit", "ran": COMMIT}},
+            "done-both": {**DESKTOP_BUILD, "require": {**req, "done_when": {"newer": "a", "command": "true"}}},
+            "done-none": {**DESKTOP_BUILD, "require": {**req, "done_when": {}}},
+            "done-timeout": {**DESKTOP_BUILD, "require": {**req, "done_when": {"command": "true", "timeout": 60}}},
+            "slow-without-result": {**COMMIT_DUTY, "require": {**COMMIT_DUTY["require"], "slow_minutes": 5}},
+            "slow-type": {**DESKTOP_BUILD, "require": {**req, "slow_minutes": "15"}},
+            "post-needs-after": {**COMMIT_REMINDER, "require": {"ran": COMMIT}},
+            "unknown-writes": {**TESTS_BEFORE_COMMIT, "unknown_writes": "ask"},
+            "pre-needs-match": {**TESTS_BEFORE_COMMIT, "match": {}},
+        }
+        for name, r in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(forge.validate(r))
+        self.assertIn("/schedule", " ".join(forge.validate(bad["time-at"])))
+
+    def test_message_names_the_trigger(self):
+        _, out = forge.evaluate([DECISION_LOG], "Stop", forge.fixture_payload(DECISION_LOG,
+                                                                               DECISION_LOG["fixtures"]["bad"][0]))
+        self.assertIn("Due since: @user: ok, let's go with option B", out["reason"])
+
+    def test_result_check_accepts_any_way_and_catches_failures(self):
+        st = lambda events, ok, now=None: forge.duty_state(DESKTOP_BUILD, events, "/p", now, forge.fixed_check(ok))
+        edit = ev("Edit", (10, 0), file_path="src/a.ts")
+        workaround = ev("Bash", (10, 1), command="node cli.js && cp out/app.exe ~/Desktop/")
+        self.assertEqual(st([edit, workaround], True)["status"], "done")   # not the usual command, still done
+        self.assertEqual(st([edit, workaround], False)["status"], "due")
+        build = ev("Bash", (10, 1), command="make app && cp out/app.exe ~/Desktop/")
+        early, late = dt.datetime(2026, 10, 16, 10, 5), dt.datetime(2026, 10, 16, 10, 30)
+        self.assertEqual(st([edit, build], False, early)["status"], "pending")  # slow: still building
+        failed = st([edit, build], False, late)
+        self.assertEqual((failed["status"], failed["failed"]), ("due", True))
+        retry = ev("Bash", (10, 29), command="make app")
+        self.assertEqual(st([edit, build, retry], False, late)["status"], "pending")  # the retry restarts the clock
+        self.assertEqual(st([], False)["status"], "idle")
+
+    def test_the_task_never_retriggers_itself(self):
+        r = duty(id="docs-after-change", require={"after": WRITES, "ran": {"tool": "Edit", "match": {"path": "glob:README.md"}},
+                                                  "done_when": {"newer": "site/index.html"}},
+                 message="m", fixtures={})
+        events = [ev("Edit", file_path="app.py"), ev("Edit", file_path="README.md"),
+                  ev("Bash", command="mkdocs build -o site/index.html")]  # writing its own result
+        self.assertEqual(forge.duty_state(r, events, "/p")["status"], "done")
+
+    def test_user_controls(self):
+        st = lambda *events: forge.duty_state(COMMIT_DUTY, list(events), "/p")
+        edit = ev("Edit", file_path="a.py")
+        self.assertEqual(st(edit, said("/always skip commit-after-update"))["status"], "idle")
+        self.assertEqual(st(edit, said("/guardrail-forge:always skip"))["notes"], [("skip", 1)])
+        self.assertEqual(st(edit, said("/always skip another-rule"))["status"], "due")
+        self.assertEqual(st(edit, said("not now"))["status"], "idle")                    # plain words
+        self.assertEqual(st(edit, said("skip it this time, thanks"))["status"], "idle")
+        self.assertEqual(st(edit, ("@claude", {"text": "let's skip the commit"}, None))["status"], "due")
+        self.assertEqual(st(edit, said("we should skip the header row when parsing the csv file, "
+                                       "and also handle empty lines properly"))["status"], "due")  # long: not a command
+        self.assertEqual(st(said("skip"), edit)["status"], "due")   # a skip before the change skips nothing
+        paused = st(said("/always pause"), edit)
+        self.assertEqual((paused["status"], paused["notes"]), ("paused", [("pause", 0)]))
+        self.assertEqual(st(said("pause"), edit, said("resume"))["status"], "due")
+        self.assertEqual(st(said("unpause"), edit)["notes"], [])     # nothing was paused
+
+    def test_attempts_then_handoff_and_confirmation(self):
+        payload = {"_calls": [("Edit", {"file_path": "src/a.ts"}, None)], "_result": False, "cwd": "/p"}
+        memo = lambda **kw: {**{k: (dict() if k == "attempts" else set()) for k in forge.NO_MEMO}, **kw}
+        key = forge.due_key(("Edit", {"file_path": "src/a.ts"}, None))
+        fired, out = forge.evaluate([DESKTOP_BUILD], "Stop", payload, memo=memo())
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("background", out["reason"])
+        self.assertNotIn("last attempt", out["reason"])
+        _, out = forge.evaluate([DESKTOP_BUILD], "Stop", payload, memo=memo(attempts={("desktop-build", key): 1}))
+        self.assertIn("last attempt", out["reason"])
+        _, out = forge.evaluate([DESKTOP_BUILD], "Stop", payload, memo=memo(attempts={("desktop-build", key): 2}))
+        self.assertNotIn("decision", out)                       # handed over: no more blocking
+        self.assertIn("still not done after 2 attempts", out["systemMessage"])
+        done = {**payload, "_result": True}
+        _, out = forge.evaluate([DESKTOP_BUILD], "Stop", done, memo=memo())
+        self.assertTrue(out["systemMessage"].startswith("✓ always-rule desktop-build: done"))
+        self.assertEqual(out["_log"][0]["kind"], "done")
+        self.assertIsNone(forge.evaluate([DESKTOP_BUILD], "Stop", done,
+                                         memo=memo(confirmed={("desktop-build", key)}))[1])  # confirmed once
+        memo2 = forge.duty_memo([{"kind": "fire", "event": "Stop", "rule": "r", "due": "k", "session": "s"},
+                                 {"kind": "fire", "event": "Stop", "rule": "r", "due": "k", "session": "s"},
+                                 {"kind": "done", "rule": "r", "key": "k", "session": "s"},
+                                 {"kind": "fire", "event": "Stop", "rule": "r", "due": "k", "session": "other"}], "s")
+        self.assertEqual(memo2["attempts"][("r", "k")], 0)    # a confirmed batch starts its attempts afresh
+
+    def test_short_yes_counts_only_as_a_reply_to_a_proposal(self):
+        approve = {"tool": "@user", "match": {"text": "re:(?i)^\\W*(yes|ok|go ahead|do it|نعم|تمام)\\b"},
+                   "replying_to": "re:(?i)\\?\\s*$|\\b(shall i|want me to|i propose)\\b"}
+        r = duty(id="pdf-after-decision", require={"after": approve, "ran": {"tool": "Bash", "match": {"command": "cmd:^pandoc\\b"}}},
+                 message="Rebuild plan.pdf.", fixtures={})
+        self.assertEqual(forge.validate({**r, "fixtures": COMMIT_DUTY["fixtures"]}), [])
+        claude = lambda t: ("@claude", {"text": t}, None)
+        st = lambda *events: forge.duty_state(r, list(events), "/p")["status"]
+        self.assertEqual(st(claude("Shall I switch the report to A4?"), said("yes")), "due")
+        self.assertEqual(st(claude("Want me to add a chart? I can."), said("تمام")), "due")
+        self.assertEqual(st(claude("Done, the tests pass."), said("ok")), "idle")      # not a proposal
+        self.assertEqual(st(said("yes")), "idle")                                       # nothing proposed
+        self.assertTrue(forge.validate({**r, "require": {**r["require"], "after": {**approve, "replying_to": "\\?"}}}))
+
+    def test_duty_conflicts_with_a_rule_that_blocks_its_action(self):
+        no_commit = rule(id="no-commit", tool="Bash", match={"command": "cmd:^git commit\\b"}, message="never commit",
+                         fixtures={"bad": [fx("Bash", command="git commit -m x")], "good": [fx("Bash", command="git status")],
+                                   "near_miss": [fx("Bash", command="echo git commit")]})
+        fails = forge.run_suite([COMMIT_DUTY, no_commit])[1]
+        self.assertTrue(any("which no-commit blocks" in f for f in fails), fails)
+
+    def test_two_rules_that_trigger_each_other_are_refused(self):
+        api, docs = {"tool": "Edit|Write", "match": {"path": "glob:api/**"}}, {"tool": "Edit|Write", "match": {"path": "glob:docs/**"}}
+        docs_rule = duty(id="docs-after-api", require={"after": api, "ran": docs}, message="update docs",
+                         fixtures={"bad": [{"transcript": [fx("Edit", file_path="api/a.py")]}],
+                                   "good": [{"transcript": [fx("Edit", file_path="api/a.py"), fx("Edit", file_path="docs/a.md")]}],
+                                   "near_miss": [{"transcript": [fx("Edit", file_path="x.py")]}]})
+        api_rule = duty(id="api-after-docs", require={"after": docs, "ran": api}, message="regenerate api",
+                        fixtures={"bad": [{"transcript": [fx("Edit", file_path="docs/a.md")]}],
+                                  "good": [{"transcript": [fx("Edit", file_path="docs/a.md"), fx("Edit", file_path="api/a.py")]}],
+                                  "near_miss": [{"transcript": [fx("Edit", file_path="x.py")]}]})
+        fails = forge.run_suite([docs_rule, api_rule])[1]
+        self.assertTrue(any(f.startswith("LOOP") for f in fails), fails)
+        self.assertEqual(forge.run_suite([docs_rule, COMMIT_DUTY])[1], [])  # a one-way chain ends
+
+    def test_order_rule_without_after_needs_ran_once(self):
+        r = duty(id="read-contributing-first", event="PreToolUse", decision="deny", tool="Bash",
+                 match={"command": "cmd:^git commit\\b"}, message="Read CONTRIBUTING.md before the first commit.",
+                 require={"ran": {"tool": "Read", "match": {"file_path": "glob:**/CONTRIBUTING.md"}}},
+                 fixtures={"bad": [fx("Bash", command="git commit -m x")],
+                           "good": [{"transcript": [fx("Read", file_path="CONTRIBUTING.md")], **fx("Bash", command="git commit -m x")}],
+                           "near_miss": [fx("Bash", command="git status")]})
+        self.assertEqual(forge.validate(r), [])
+        self.assertEqual(forge.run_suite([r])[1], [])
+
+    def test_order_gate_does_not_count_the_call_itself(self):
+        r = duty(id="commit-before-next-edit", event="PreToolUse", decision="deny", tool="Edit|Write",
+                 match={"path": "glob:**"}, require={"after": {"tool": "Edit|Write", "match": {"path": "glob:**"}},
+                                                     "ran": COMMIT},
+                 message="Commit your last change before the next edit.",
+                 fixtures={"bad": [{"transcript": [fx("Edit", file_path="a.py")], **fx("Edit", file_path="b.py")}],
+                           "good": [{"transcript": [fx("Edit", file_path="a.py"), fx("Bash", command="git commit -am a")],
+                                     **fx("Edit", file_path="b.py")}],
+                           "near_miss": [fx("Edit", file_path="first.py")]})
+        self.assertEqual(forge.validate(r), [])
+        self.assertEqual(forge.run_suite([r])[1], [])
+
+    def test_transcript_parsing(self):
+        cmd = ("<command-message>always</command-message>\n<command-name>/always</command-name>\n"
+               "<command-args>skip desktop-build</command-args>")
+        self.assertEqual(forge.entry_events({"type": "user", "message": {"content": cmd}})[0][:2],
+                         ("@user", {"text": "/always skip desktop-build"}))
+        self.assertEqual(forge.entry_events({"type": "user", "message": {"content": "<local-command-stdout>x"}}), [])
+        self.assertEqual(forge.entry_events({"type": "attachment", "attachment": {"type": "queued_command"}}), [])
+        self.assertEqual(forge.local_time("2026-10-14T18:05:00"), dt.datetime(2026, 10, 14, 18, 5))
+        self.assertIsNone(forge.local_time("2026-10-14T18:05:00.123Z").tzinfo)
+        self.assertIsNone(forge.local_time("nope"))
+
+
+class DutyHooks(Sandbox):
+    def transcript(self, entries):
+        path = os.path.join(self.tmp.name, "t.jsonl")
+        with open(path, "w") as f:
+            for e in entries:
+                e = dict(e)
+                ts = e.pop("at", None)
+                if "user" in e:
+                    line = {"type": "user", "message": {"role": "user", "content": e["user"]}}
+                else:
+                    line = {"type": "assistant", "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "x", "name": e["tool_name"], "input": e["tool_input"]}]}}
+                if ts:
+                    line["timestamp"] = ts
+                f.write(json.dumps(line) + "\n")
+        return path
+
+    def ago(self, minutes):
+        return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat()
+
+    def stop(self, t, again=False):
+        return self.hook("stop", {"transcript_path": t, "stop_hook_active": again})
+
+    def test_decision_summary_gate_reads_user_text(self):
+        self.assertEqual(self.add(DECISION_LOG).returncode, 0)
+        t = self.transcript([{"user": "great, let's go with Postgres"}, fx("Edit", file_path="db.py")])
+        out = self.stop(t)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("DECISIONS.md", out["reason"])
+        t = self.transcript([{"user": "great, let's go with Postgres"}, fx("Write", file_path="DECISIONS.md")])
+        self.assertIsNone(self.stop(t))
+        t = self.transcript([{"user": "<local-command-stdout>go with it</local-command-stdout>"}])  # harness markup
+        self.assertIsNone(self.stop(t))
+
+    def test_desktop_build_lifecycle(self):
+        self.assertEqual(self.add(DESKTOP_BUILD).returncode, 0)
+        t = self.transcript([{**fx("Edit", file_path="src/a.ts"), "at": self.ago(3)}])
+        first = self.stop(t)
+        self.assertEqual(first["decision"], "block")
+        self.assertNotIn("last attempt", first["reason"])
+        self.assertIn("last attempt", self.stop(t, again=True)["reason"])  # attempts are counted per batch
+        handed = self.stop(t, again=True)
+        self.assertNotIn("decision", handed)
+        self.assertIn("still not done after 2 attempts (~/Desktop/app.exe does not exist)", handed["systemMessage"])
+        exe = os.path.join(self.home, "Desktop", "app.exe")
+        os.makedirs(os.path.dirname(exe))
+        with open(exe, "w") as f:
+            f.write("build")
+        done = self.stop(t)
+        self.assertNotIn("decision", done)
+        self.assertIn("✓ always-rule desktop-build: done (app.exe updated", done["systemMessage"])
+        self.assertIsNone(self.stop(t))  # confirmed once, not at every reply
+        kinds = [e["kind"] for e in self.ledger() if e.get("rule") == "desktop-build"]
+        self.assertEqual(kinds, ["added", "fire", "fire", "handoff", "done"])
+        listing = self.cli(self.forge, "list", "--always").stdout
+        self.assertIn("desktop-build", listing)
+        self.assertIn("last done", listing)
+        self.assertNotIn("no-generated-edits", listing)
+
+    def test_slow_task_running_in_background_is_not_blocked(self):
+        self.add(DESKTOP_BUILD)
+        t = self.transcript([{**fx("Edit", file_path="src/a.ts"), "at": self.ago(3)},
+                             {**fx("Bash", command="make app && cp out/app.exe ~/Desktop/"), "at": self.ago(2)}])
+        self.assertIsNone(self.stop(t))  # started 2 minutes ago, allowed 15
+        t = self.transcript([{**fx("Edit", file_path="src/a.ts"), "at": self.ago(40)},
+                             {**fx("Bash", command="make app && cp out/app.exe ~/Desktop/"), "at": self.ago(39)}])
+        out = self.stop(t)
+        self.assertIn("but the result is missing", out["reason"])  # it finished long ago and produced nothing
+
+    def test_skip_by_slash_command_is_announced_once(self):
+        self.add(COMMIT_DUTY)
+        cmd = ("<command-message>always</command-message>\n<command-name>/always</command-name>\n"
+               "<command-args>skip</command-args>")
+        t = self.transcript([fx("Edit", file_path="a.py"), {"user": cmd}])
+        out = self.stop(t)
+        self.assertNotIn("decision", out)
+        self.assertIn("Skipped always-rule commit-after-update", out["systemMessage"])
+        self.assertIsNone(self.stop(t))
+
+    def test_order_rule_through_the_hook(self):
+        self.assertEqual(self.add(TESTS_BEFORE_COMMIT).returncode, 0)
+        t = self.transcript([fx("Edit", file_path="app.py"), fx("Bash", command="git commit -m x")])
+        out = self.hook("pre", {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}, "transcript_path": t})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        t = self.transcript([fx("Edit", file_path="app.py"), fx("Bash", command="pytest")])
+        self.assertIsNone(self.hook("pre", {"tool_name": "Bash", "tool_input": {"command": "git commit -m x"},
+                                            "transcript_path": t}))
+
+    def test_reminder_once_per_batch(self):
+        self.assertEqual(self.add(COMMIT_REMINDER).returncode, 0)
+        t = self.transcript([fx("Edit", file_path="a.py")])
+        call = {"tool_name": "Edit", "tool_input": {"file_path": "b.py"}, "transcript_path": t}
+        self.assertIn("uncommitted", self.hook("post", call)["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.hook("post", call))  # already reminded about this batch
+
+    def test_backtest_judges_each_turn(self):
+        tdir = os.path.join(self.tmp.name, "history")
+        os.makedirs(tdir)
+        lines = [{"type": "user", "uuid": "u1", "message": {"role": "user", "content": "ok let's go with B"}},
+                 {"type": "assistant", "uuid": "a1", "message": {"content": [
+                     {"type": "tool_use", "id": "t1", "name": "Edit", "input": {"file_path": "b.py"}}]}},
+                 {"type": "user", "uuid": "u2", "message": {"role": "user", "content": "thanks, next task"}},
+                 {"type": "assistant", "uuid": "a2", "message": {"content": [
+                     {"type": "tool_use", "id": "t2", "name": "Edit", "input": {"file_path": "c.py"}}]}}]
+        with open(os.path.join(tdir, "s1.jsonl"), "w") as f:
+            for line in lines:
+                f.write(json.dumps({"sessionId": "s1", "cwd": self.proj, "timestamp": "2026-10-01T10:00:00Z", **line}) + "\n")
+        out = self.cli(self.forge, "backtest", "-", "--transcripts", tdir, stdin=json.dumps(DECISION_LOG)).stdout
+        self.assertIn("2 past tool calls in 1 session(s)", out)
+        self.assertIn("would have fired 1 time(s)", out)
+        self.assertIn("due since @user: ok let's go with B", out)
+        fixtures = self.cli(self.forge, "backtest", "-", "--transcripts", tdir, "--fixtures",
+                            stdin=json.dumps(DECISION_LOG)).stdout
+        self.assertIn('"transcript"', fixtures)
 
 
 if __name__ == "__main__":
