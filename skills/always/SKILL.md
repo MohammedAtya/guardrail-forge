@@ -1,6 +1,7 @@
 ---
 name: always
 description: Make Claude always do something as part of its work, enforced by a hook instead of memory. Creates an always-rule from one sentence ("/always rebuild the app and copy it to my desktop after code changes", "/always commit after every update", "/always run the tests before you commit", "/always update the PDF after every change we decide"), and controls existing ones with /always skip, pause, resume, list, remove. Use when the user types /always, or asks Claude to do something every time, after every change, or before another step.
+argument-hint: "[skip|pause|resume|list|remove] [rule]  or  <what Claude should always do>"
 ---
 
 # Always

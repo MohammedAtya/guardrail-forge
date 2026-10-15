@@ -1,6 +1,7 @@
 ---
 name: forge
 description: Forge a user's correction into an enforced never-rule (hook, permission deny, or stop gate) proven by fixtures, instead of a CLAUDE.md line. Use when the user types /forge, corrects a repeated mistake ("don't do that again", "never X", "stop doing Z"), or asks to audit, list, or remove guardrails. For "always do X after/before Y", use the /always skill.
+argument-hint: "[harvest|audit|list|doctor|remove <id>]  or  <what Claude should never do>"
 ---
 
 # Forge
